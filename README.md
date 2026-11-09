@@ -45,16 +45,37 @@ Every log entry on disk is framed in big-endian byte order:
 
 ---
 
-## 3. Directory Layout
+## 3. Storage & Index Architecture
+
+### Append-Only Log Segments (Milestone 2)
+
+- Managed by `SegmentManager` and backed by `FileLogSegment`.
+- Concurrently readable via positional `FileChannel.read(dst, offset)` (`pread`).
+- Automatic rotation when active segment exceeds configured size threshold.
+
+### KeyDir Index (Milestone 3)
+
+ChronoCask provides two implementations conforming to the same `KeyDir` interface:
+
+1. **`HeapKeyDir`**: Reference implementation backed by `ConcurrentHashMap` with `ByteArrayKey`.
+2. **`OffHeapKeyDir`**: High-performance native memory implementation powered by Java FFM (`Arena`, `MemorySegment`):
+   - Cache-line aligned 64-byte slots in contiguous off-heap memory.
+   - Open addressing with linear probing and 64-bit hash fingerprints (`HashUtil`).
+   - Dynamic off-heap key slab storage for variable-length keys.
+   - Deterministic reclamation with zero JVM garbage collection pause impact.
+
+#### 64-Byte Slot Layout
 
 ```text
-chronocask-data/
-├── MANIFEST
-├── segment-000001.log
-├── segment-000002.log
-└── hints/
-    ├── segment-000001.hint
-    └── segment-000002.hint
++--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
+| Offset | Size (B) | Type    | Field           | Offset     | Size (B)   | Type          | Field        | Description  |
++--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
+| 0      | 1        | byte    | State           | 24         | 4          | int           | SegmentId    | Segment file |
+| 1      | 3        | padding | Reserved        | 28         | 4          | int           | RecordSize   | Header+Data  |
+| 4      | 4        | int     | KeyLength       | 32         | 8          | long          | RecordOffset | Disk offset  |
+| 8      | 8        | long    | HashFingerprint | 40         | 4          | int           | ValueLength  | Value size   |
+| 16     | 8        | long    | KeyOffset       | 48         | 8          | long          | SequenceNum  | Logical seq  |
++--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
 ```
 
 ---
