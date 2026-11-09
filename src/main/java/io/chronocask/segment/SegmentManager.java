@@ -2,7 +2,6 @@ package io.chronocask.segment;
 
 import io.chronocask.exception.StorageException;
 import io.chronocask.record.Record;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
@@ -31,37 +30,67 @@ import java.util.regex.Pattern;
 public class SegmentManager implements Closeable {
 
     public static final long DEFAULT_MAX_SEGMENT_SIZE_BYTES = 64 * 1024 * 1024L; // 64 MB
-    private static final Pattern SEGMENT_FILE_PATTERN = Pattern.compile("^segment-(\\d+)\\.log$");
+    private static final Pattern SEGMENT_FILE_PATTERN = Pattern.compile(
+        "^segment-(\\d+)\\.log$"
+    );
     private static final String SEGMENT_NAME_FORMAT = "segment-%06d.log";
 
     private final Path baseDir;
     private final long maxSegmentSizeBytes;
     private final DurabilityMode defaultDurability;
 
-    private final ConcurrentNavigableMap<Integer, LogSegment> immutableSegments = new ConcurrentSkipListMap<>();
+    private final ConcurrentNavigableMap<
+        Integer,
+        LogSegment
+    > immutableSegments = new ConcurrentSkipListMap<>();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     private volatile LogSegment activeSegment;
     private volatile boolean closed = false;
 
-    private SegmentManager(Path baseDir, long maxSegmentSizeBytes, DurabilityMode defaultDurability) {
-        this.baseDir = Objects.requireNonNull(baseDir, "baseDir cannot be null");
-        this.maxSegmentSizeBytes = maxSegmentSizeBytes > 0 ? maxSegmentSizeBytes : DEFAULT_MAX_SEGMENT_SIZE_BYTES;
-        this.defaultDurability = Objects.requireNonNull(defaultDurability, "defaultDurability cannot be null");
+    private SegmentManager(
+        Path baseDir,
+        long maxSegmentSizeBytes,
+        DurabilityMode defaultDurability
+    ) {
+        this.baseDir = Objects.requireNonNull(
+            baseDir,
+            "baseDir cannot be null"
+        );
+        this.maxSegmentSizeBytes =
+            maxSegmentSizeBytes > 0
+                ? maxSegmentSizeBytes
+                : DEFAULT_MAX_SEGMENT_SIZE_BYTES;
+        this.defaultDurability = Objects.requireNonNull(
+            defaultDurability,
+            "defaultDurability cannot be null"
+        );
     }
 
     /**
      * Initializes a SegmentManager in the given directory with default configuration.
      */
     public static SegmentManager open(Path baseDir) throws IOException {
-        return open(baseDir, DEFAULT_MAX_SEGMENT_SIZE_BYTES, DurabilityMode.ASYNC);
+        return open(
+            baseDir,
+            DEFAULT_MAX_SEGMENT_SIZE_BYTES,
+            DurabilityMode.ASYNC
+        );
     }
 
     /**
      * Initializes a SegmentManager with custom segment size threshold and durability mode.
      */
-    public static SegmentManager open(Path baseDir, long maxSegmentSizeBytes, DurabilityMode defaultDurability) throws IOException {
-        SegmentManager manager = new SegmentManager(baseDir, maxSegmentSizeBytes, defaultDurability);
+    public static SegmentManager open(
+        Path baseDir,
+        long maxSegmentSizeBytes,
+        DurabilityMode defaultDurability
+    ) throws IOException {
+        SegmentManager manager = new SegmentManager(
+            baseDir,
+            maxSegmentSizeBytes,
+            defaultDurability
+        );
         manager.initialize();
         return manager;
     }
@@ -73,9 +102,16 @@ public class SegmentManager implements Closeable {
         Files.createDirectories(baseDir);
 
         List<Integer> existingIds = new ArrayList<>();
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(baseDir, "segment-*.log")) {
+        try (
+            DirectoryStream<Path> stream = Files.newDirectoryStream(
+                baseDir,
+                "segment-*.log"
+            )
+        ) {
             for (Path entry : stream) {
-                Integer segmentId = parseSegmentId(entry.getFileName().toString());
+                Integer segmentId = parseSegmentId(
+                    entry.getFileName().toString()
+                );
                 if (segmentId != null) {
                     existingIds.add(segmentId);
                 }
@@ -87,26 +123,34 @@ public class SegmentManager implements Closeable {
         if (existingIds.isEmpty()) {
             // First time initialization: create segment-000001.log
             int initialId = 1;
-            Path initialPath = baseDir.resolve(formatSegmentFileName(initialId));
-            this.activeSegment = FileLogSegment.createActive(initialPath, initialId);
+            Path initialPath = baseDir.resolve(
+                formatSegmentFileName(initialId)
+            );
+            this.activeSegment = FileLogSegment.createActive(
+                initialPath,
+                initialId
+            );
         } else {
             // Open all earlier segments as sealed/immutable
             for (int i = 0; i < existingIds.size() - 1; i++) {
                 int id = existingIds.get(i);
                 Path path = baseDir.resolve(formatSegmentFileName(id));
-                LogSegment segment = FileLogSegment.openExisting(path, id, true);
+                LogSegment segment = FileLogSegment.openExisting(
+                    path,
+                    id,
+                    true
+                );
                 immutableSegments.put(id, segment);
             }
 
             // Open the highest segment as the active segment
             int activeId = existingIds.get(existingIds.size() - 1);
             Path activePath = baseDir.resolve(formatSegmentFileName(activeId));
-            this.activeSegment = FileLogSegment.openExisting(activePath, activeId, false);
-
-            // If existing active segment has already reached capacity, rotate immediately
-            if (activeSegment.size() >= maxSegmentSizeBytes) {
-                rotateActiveSegment();
-            }
+            this.activeSegment = FileLogSegment.openExisting(
+                activePath,
+                activeId,
+                false
+            );
         }
     }
 
@@ -120,7 +164,8 @@ public class SegmentManager implements Closeable {
     /**
      * Appends a record using the specified durability mode, performing segment rotation if needed.
      */
-    public RecordLocation append(Record record, DurabilityMode durability) throws IOException {
+    public RecordLocation append(Record record, DurabilityMode durability)
+        throws IOException {
         Objects.requireNonNull(record, "record cannot be null");
         Objects.requireNonNull(durability, "durability cannot be null");
 
@@ -130,7 +175,10 @@ public class SegmentManager implements Closeable {
 
             // Rotate if adding this record would exceed max segment size,
             // unless activeSegment is currently empty (to accommodate records larger than max size)
-            if (activeSegment.size() > 0 && (activeSegment.size() + record.totalSize() > maxSegmentSizeBytes)) {
+            if (
+                activeSegment.size() > 0 &&
+                activeSegment.size() + record.totalSize() > maxSegmentSizeBytes
+            ) {
                 rotateActiveSegment();
             }
 
@@ -150,8 +198,13 @@ public class SegmentManager implements Closeable {
         immutableSegments.put(activeSegment.segmentId(), activeSegment);
 
         int nextSegmentId = activeSegment.segmentId() + 1;
-        Path nextSegmentPath = baseDir.resolve(formatSegmentFileName(nextSegmentId));
-        this.activeSegment = FileLogSegment.createActive(nextSegmentPath, nextSegmentId);
+        Path nextSegmentPath = baseDir.resolve(
+            formatSegmentFileName(nextSegmentId)
+        );
+        this.activeSegment = FileLogSegment.createActive(
+            nextSegmentPath,
+            nextSegmentId
+        );
     }
 
     /**
@@ -163,7 +216,9 @@ public class SegmentManager implements Closeable {
 
         LogSegment segment = getSegment(location.segmentId());
         if (segment == null) {
-            throw new StorageException("Segment " + location.segmentId() + " not found for " + location);
+            throw new StorageException(
+                "Segment " + location.segmentId() + " not found for " + location
+            );
         }
         return segment.read(location);
     }
@@ -199,7 +254,10 @@ public class SegmentManager implements Closeable {
     public List<LogSegment> getAllSegments() {
         List<LogSegment> all = new ArrayList<>(immutableSegments.values());
         LogSegment currentActive = this.activeSegment;
-        if (currentActive != null && !immutableSegments.containsKey(currentActive.segmentId())) {
+        if (
+            currentActive != null &&
+            !immutableSegments.containsKey(currentActive.segmentId())
+        ) {
             all.add(currentActive);
         }
         return Collections.unmodifiableList(all);
@@ -213,8 +271,12 @@ public class SegmentManager implements Closeable {
         writeLock.lock();
         try {
             ensureOpen();
-            if (activeSegment != null && activeSegment.segmentId() == segmentId) {
-                throw new IllegalStateException("Cannot delete active segment: " + segmentId);
+            if (
+                activeSegment != null && activeSegment.segmentId() == segmentId
+            ) {
+                throw new IllegalStateException(
+                    "Cannot delete active segment: " + segmentId
+                );
             }
             LogSegment segment = immutableSegments.remove(segmentId);
             if (segment != null) {
