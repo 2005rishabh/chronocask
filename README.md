@@ -18,7 +18,58 @@ ChronoCask is an embedded persistent key-value storage engine inspired by the Bi
 
 ---
 
-## 2. Binary Record Format (Milestone 1)
+## 2. Quickstart & Client API (Milestone 5)
+
+ChronoCask provides an intuitive, high-performance embedded Java API:
+
+```java
+import io.chronocask.api.ChronoCask;
+import io.chronocask.api.ChronoCaskConfig;
+import io.chronocask.api.WriteOptions;
+
+import java.nio.file.Path;
+
+// Open store with default settings (off-heap index, ASYNC durability)
+try (ChronoCask store = ChronoCask.open(Path.of("./data"))) {
+
+    // PUT operations
+    store.put("user:101", "Rishabh");
+    store.put("user:102", "Alice", WriteOptions.sync()); // Force fsync
+
+    // GET operations (O(1) direct offset lookup)
+    String user = store.get("user:101");
+    System.out.println("Found: " + user);
+
+    // DELETE operation (appends tombstone to log segment)
+    store.delete("user:102");
+
+    // Check existence and size
+    boolean exists = store.containsKey("user:101"); // true
+    long totalKeys = store.size();                   // 1
+
+    // Scan all active entries
+    store.forEach((key, val) -> System.out.println(key + " -> " + val));
+}
+```
+
+### Custom Engine Configuration
+
+```java
+ChronoCaskConfig config = ChronoCaskConfig.builder(Path.of("./data"))
+    .maxSegmentSizeBytes(64 * 1024 * 1024L) // 64 MB segment rotation threshold
+    .offHeapIndex(true)                     // Use native FFM off-heap index
+    .initialIndexCapacity(2048)
+    .initialKeySlabBytes(2 * 1024 * 1024L)
+    .build();
+
+try (ChronoCask store = ChronoCask.open(config)) {
+    // ...
+}
+```
+
+---
+
+## 3. Binary Record Format (Milestone 1)
 
 Every log entry on disk is framed in big-endian byte order:
 
@@ -45,7 +96,7 @@ Every log entry on disk is framed in big-endian byte order:
 
 ---
 
-## 3. Storage & Index Architecture
+## 4. Storage & Index Architecture
 
 ### Append-Only Log Segments (Milestone 2)
 
@@ -78,14 +129,20 @@ ChronoCask provides two implementations conforming to the same `KeyDir` interfac
 +--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
 ```
 
+### Crash Recovery & Replay (Milestone 4)
+
+- Executed by `RecoveryManager` on startup.
+- Inspects and validates segments sequentially, verifying CRC32C checksums.
+- Gracefully truncates partial crash tails in the active segment while strictly flagging corruption within earlier records.
+
 ---
 
-## 4. Requirements & Build
+## 5. Requirements & Build
 
 - **Java Development Kit (JDK)**: Java 25
 - **Build Tool**: Apache Maven 3.8+
 
 ```bash
-# Clean and run test suite
+# Clean and run full test suite
 mvn clean test
 ```
