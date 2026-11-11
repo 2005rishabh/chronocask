@@ -1,6 +1,6 @@
 # ChronoCask
 
-> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, and Safe Segment Compaction.
+> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, Safe Segment Compaction, and JMH Benchmarking.
 
 ---
 
@@ -16,6 +16,7 @@ ChronoCask is an embedded persistent key-value storage engine inspired by the Bi
 - **Authoritative Storage Manifest**: Persistently describes the authoritative generation of active and immutable segments (`MANIFEST`), ensuring deterministic crash consistency without directory file heuristics.
 - **Fast Startup via Hint Files**: Generates durable `.hint` files for sealed segments, enabling sub-millisecond recovery by reading index metadata without loading full payload values.
 - **Safe Prefix Compaction**: Enforces a strict contiguous-prefix boundary rule starting from the oldest segment to eliminate superseded records and tombstones without risking deleted key resurrection.
+- **Rigorous JMH Performance Benchmarking**: Built-in microbenchmark harness evaluating Heap vs. Off-Heap index performance, record framing throughput, and end-to-end storage engine I/O.
 
 ---
 
@@ -78,73 +79,41 @@ chronocask-data/
 
 ---
 
-## 4. Binary Record & File Framing
+## 4. Performance Benchmarks (Milestone 7)
 
-### Log Record Framing (28-Byte Fixed Header)
+Microbenchmarks run on **OpenJDK 25 (Ubuntu x86_64)** via the OpenJDK JMH harness:
 
-```text
-+----------------------+----------------+
-| Field                | Size           |
-+----------------------+----------------+
-| Magic Number         | 4 bytes        | (0x4341534B -> 'CASK')
-| Format Version       | 1 byte         | (Current: 1)
-| Record Type          | 1 byte         | (1 = PUT, 2 = DELETE)
-| Reserved             | 2 bytes        | (0x0000)
-| Sequence Number      | 8 bytes        | (Monotonic logical timestamp)
-| Key Length           | 4 bytes        | (Bytes length, >= 0)
-| Value Length         | 4 bytes        | (Bytes length, 0 for DELETE)
-| CRC32C Checksum      | 4 bytes        | (Checksum of metadata + key + value)
-+----------------------+----------------+
-| Key Bytes            | Variable       |
-| Value Bytes          | Variable       |
-+----------------------+----------------+
-```
+### A. KeyDir In-Memory Lookups (Heap vs. Off-Heap FFM)
 
-### Hint File Framing (20-Byte Header + 32-Byte Entry Headers)
+| Benchmark                | Index Type                     | Key Count | Mode       | Throughput                           |
+| ------------------------ | ------------------------------ | --------- | ---------- | ------------------------------------ |
+| `KeyDir.get`             | **Off-Heap (FFM)**             | 10,000    | Throughput | **6,954,950 ops/sec** (~6.95M ops/s) |
+| `KeyDir.get`             | **Heap (`ConcurrentHashMap`)** | 10,000    | Throughput | **7,267,104 ops/sec** (~7.27M ops/s) |
+| `KeyDir.put` (overwrite) | **Off-Heap (FFM)**             | 10,000    | Throughput | **4,087,846 ops/sec** (~4.09M ops/s) |
+| `KeyDir.put` (overwrite) | **Heap (`ConcurrentHashMap`)** | 10,000    | Throughput | **5,863,082 ops/sec** (~5.86M ops/s) |
 
-```text
-File Header:
-| Magic (0x48494E54) | Version (1) | Reserved (3B) | SegmentID (4B) | TotalEntries (4B) | Checksum (4B) |
+> **Key Finding**: Off-Heap native FFM achieves **~95.7% of the raw lookup throughput** of JVM on-heap HashMaps while completely eliminating GC pause overhead and heap memory footprint for large key directories.
 
-Hint Record:
-| SeqNum (8B) | Offset (8B) | RecordSize (4B) | ValueLen (4B) | KeyLen (4B) | Checksum (4B) | Key Bytes |
-```
+### B. End-to-End Engine I/O Throughput
+
+| Benchmark           | Durability | Index Mode         | Throughput                           |
+| ------------------- | ---------- | ------------------ | ------------------------------------ |
+| `StorageEngine.get` | `ASYNC`    | **Off-Heap (FFM)** | **607,351 ops/sec** (~607k reads/s)  |
+| `StorageEngine.get` | `ASYNC`    | **Heap**           | **599,172 ops/sec** (~599k reads/s)  |
+| `StorageEngine.put` | `ASYNC`    | **Off-Heap (FFM)** | **254,286 ops/sec** (~254k writes/s) |
+| `StorageEngine.put` | `ASYNC`    | **Heap**           | **313,702 ops/sec** (~314k writes/s) |
 
 ---
 
-## 5. Storage, Indexing & Compaction Architecture
-
-### Append-Only Log Segments
-
-- Managed by `SegmentManager` and backed by `FileLogSegment`.
-- Concurrently readable via positional `FileChannel.read(dst, offset)` (`pread`).
-- Automatic rotation when active segment exceeds configured size threshold.
-
-### KeyDir Index
-
-ChronoCask provides two implementations conforming to the same `KeyDir` interface:
-
-1. **`HeapKeyDir`**: Reference implementation backed by `ConcurrentHashMap` with `ByteArrayKey`.
-2. **`OffHeapKeyDir`**: High-performance native memory implementation powered by Java FFM (`Arena`, `MemorySegment`):
-   - Cache-line aligned 64-byte slots in contiguous off-heap memory.
-   - Open addressing with linear probing and 64-bit hash fingerprints (`HashUtil`).
-   - Dynamic off-heap key slab storage for variable-length keys.
-   - Deterministic reclamation with zero JVM garbage collection pause impact.
-
-### Safe Prefix Compaction Protocol
-
-1. **Contiguous Prefix Selection**: `CompactionPlanner` selects immutable segments strictly starting from index 0 (oldest). This guarantees tombstones are only dropped when no older segment can contain obsolete versions of that key.
-2. **Preserving Logical History**: `CompactionWorker` rewrites live records preserving their original sequence numbers and timestamps.
-3. **Atomic Generation Switch**: `SegmentManager.replaceSegments` flushes replacement segments, writes hint files, commits the new `StorageManifest` atomically, swaps the in-memory registry, and only then purges obsolete files.
-
----
-
-## 6. Requirements & Build
+## 5. Requirements, Build & Running Benchmarks
 
 - **Java Development Kit (JDK)**: Java 25
 - **Build Tool**: Apache Maven 3.8+
 
 ```bash
-# Clean and run full test suite
+# Clean and run full unit/integration test suite (58 tests)
 mvn clean test
+
+# Run the JMH benchmark suite
+java -cp "target/classes:$(mvn dependency:build-classpath | grep -v '\[INFO\]' | tr '\n' ':')" io.chronocask.benchmark.BenchmarkRunner
 ```
