@@ -1,24 +1,25 @@
 # ChronoCask
 
-> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, and Crash Recovery.
+> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, and Safe Segment Compaction.
 
 ---
 
 ## 1. Overview
 
-ChronoCask is an embedded persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, and crash-consistent recovery.
+ChronoCask is an embedded persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, deterministic crash recovery, and crash-safe segment compaction.
 
 ### Key Architectural Highlights
 
 - **Append-Only Disk Storage**: Eliminates random disk writes during mutations by writing sequential records to append-only log segments.
 - **In-Memory KeyDir Index**: Maps keys to exact segment and byte offsets for $O(1)$ read lookups without scanning disk logs.
 - **Native Memory Management**: Implements an off-heap hash-table index using Java's FFM API (`MemorySegment`, `Arena`) to eliminate Java GC overhead for large key spaces.
-- **Crash Durability & Recovery**: Strict record framing with CRC32C checksums to identify bit rot, crash truncation, and partial writes during recovery.
-- **Space Reclamation**: Segment compaction protocol that safely purges superseded records and tombstones into fresh immutable segments.
+- **Authoritative Storage Manifest**: Persistently describes the authoritative generation of active and immutable segments (`MANIFEST`), ensuring deterministic crash consistency without directory file heuristics.
+- **Fast Startup via Hint Files**: Generates durable `.hint` files for sealed segments, enabling sub-millisecond recovery by reading index metadata without loading full payload values.
+- **Safe Prefix Compaction**: Enforces a strict contiguous-prefix boundary rule starting from the oldest segment to eliminate superseded records and tombstones without risking deleted key resurrection.
 
 ---
 
-## 2. Quickstart & Client API (Milestone 5)
+## 2. Quickstart & Client API
 
 ChronoCask provides an intuitive, high-performance embedded Java API:
 
@@ -26,6 +27,7 @@ ChronoCask provides an intuitive, high-performance embedded Java API:
 import io.chronocask.api.ChronoCask;
 import io.chronocask.api.ChronoCaskConfig;
 import io.chronocask.api.WriteOptions;
+import io.chronocask.compaction.CompactionResult;
 
 import java.nio.file.Path;
 
@@ -49,29 +51,36 @@ try (ChronoCask store = ChronoCask.open(Path.of("./data"))) {
 
     // Scan all active entries
     store.forEach((key, val) -> System.out.println(key + " -> " + val));
-}
-```
 
-### Custom Engine Configuration
-
-```java
-ChronoCaskConfig config = ChronoCaskConfig.builder(Path.of("./data"))
-    .maxSegmentSizeBytes(64 * 1024 * 1024L) // 64 MB segment rotation threshold
-    .offHeapIndex(true)                     // Use native FFM off-heap index
-    .initialIndexCapacity(2048)
-    .initialKeySlabBytes(2 * 1024 * 1024L)
-    .build();
-
-try (ChronoCask store = ChronoCask.open(config)) {
-    // ...
+    // Run synchronous log compaction (reclaims space from old PUTs and tombstones)
+    CompactionResult stats = store.compact();
+    System.out.println("Reclaimed bytes: " + stats.bytesReclaimed());
 }
 ```
 
 ---
 
-## 3. Binary Record Format (Milestone 1)
+## 3. Directory Layout & Persistence Model
 
-Every log entry on disk is framed in big-endian byte order:
+```text
+chronocask-data/
+├── MANIFEST
+├── segment-000001.log
+├── segment-000002.log
+└── hints/
+    ├── segment-000001.hint
+    └── segment-000002.hint
+```
+
+- **`MANIFEST`**: Authoritative record of the active database generation, tracking active segment ID, immutable segment list, and hint file status. Commits are atomic via `MANIFEST.tmp` + `ATOMIC_MOVE` + `force(true)`.
+- **`segment-*.log`**: Append-only log files. Mutations are strictly sequential.
+- **`hints/segment-*.hint`**: Compact index files containing key and record offset metadata (no values) to enable near-instantaneous startup recovery.
+
+---
+
+## 4. Binary Record & File Framing
+
+### Log Record Framing (28-Byte Fixed Header)
 
 ```text
 +----------------------+----------------+
@@ -91,20 +100,27 @@ Every log entry on disk is framed in big-endian byte order:
 +----------------------+----------------+
 ```
 
-- **Fixed Header Size**: 28 bytes
-- **Checksum Coverage**: Covers Magic, Version, Type, Reserved, Sequence, Key Length, Value Length, Key Bytes, and Value Bytes.
+### Hint File Framing (20-Byte Header + 32-Byte Entry Headers)
+
+```text
+File Header:
+| Magic (0x48494E54) | Version (1) | Reserved (3B) | SegmentID (4B) | TotalEntries (4B) | Checksum (4B) |
+
+Hint Record:
+| SeqNum (8B) | Offset (8B) | RecordSize (4B) | ValueLen (4B) | KeyLen (4B) | Checksum (4B) | Key Bytes |
+```
 
 ---
 
-## 4. Storage & Index Architecture
+## 5. Storage, Indexing & Compaction Architecture
 
-### Append-Only Log Segments (Milestone 2)
+### Append-Only Log Segments
 
 - Managed by `SegmentManager` and backed by `FileLogSegment`.
 - Concurrently readable via positional `FileChannel.read(dst, offset)` (`pread`).
 - Automatic rotation when active segment exceeds configured size threshold.
 
-### KeyDir Index (Milestone 3)
+### KeyDir Index
 
 ChronoCask provides two implementations conforming to the same `KeyDir` interface:
 
@@ -115,29 +131,15 @@ ChronoCask provides two implementations conforming to the same `KeyDir` interfac
    - Dynamic off-heap key slab storage for variable-length keys.
    - Deterministic reclamation with zero JVM garbage collection pause impact.
 
-#### 64-Byte Slot Layout
+### Safe Prefix Compaction Protocol
 
-```text
-+--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
-| Offset | Size (B) | Type    | Field           | Offset     | Size (B)   | Type          | Field        | Description  |
-+--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
-| 0      | 1        | byte    | State           | 24         | 4          | int           | SegmentId    | Segment file |
-| 1      | 3        | padding | Reserved        | 28         | 4          | int           | RecordSize   | Header+Data  |
-| 4      | 4        | int     | KeyLength       | 32         | 8          | long          | RecordOffset | Disk offset  |
-| 8      | 8        | long    | HashFingerprint | 40         | 4          | int           | ValueLength  | Value size   |
-| 16     | 8        | long    | KeyOffset       | 48         | 8          | long          | SequenceNum  | Logical seq  |
-+--------+----------+---------+-----------------+------------+------------+---------------+--------------+--------------+
-```
-
-### Crash Recovery & Replay (Milestone 4)
-
-- Executed by `RecoveryManager` on startup.
-- Inspects and validates segments sequentially, verifying CRC32C checksums.
-- Gracefully truncates partial crash tails in the active segment while strictly flagging corruption within earlier records.
+1. **Contiguous Prefix Selection**: `CompactionPlanner` selects immutable segments strictly starting from index 0 (oldest). This guarantees tombstones are only dropped when no older segment can contain obsolete versions of that key.
+2. **Preserving Logical History**: `CompactionWorker` rewrites live records preserving their original sequence numbers and timestamps.
+3. **Atomic Generation Switch**: `SegmentManager.replaceSegments` flushes replacement segments, writes hint files, commits the new `StorageManifest` atomically, swaps the in-memory registry, and only then purges obsolete files.
 
 ---
 
-## 5. Requirements & Build
+## 6. Requirements & Build
 
 - **Java Development Kit (JDK)**: Java 25
 - **Build Tool**: Apache Maven 3.8+

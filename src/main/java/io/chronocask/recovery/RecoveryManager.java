@@ -2,6 +2,9 @@ package io.chronocask.recovery;
 
 import io.chronocask.exception.CorruptRecordException;
 import io.chronocask.exception.StorageException;
+import io.chronocask.hint.HintEntry;
+import io.chronocask.hint.HintFileReader;
+import io.chronocask.hint.HintFileWriter;
 import io.chronocask.index.IndexEntry;
 import io.chronocask.index.KeyDir;
 import io.chronocask.record.Record;
@@ -15,6 +18,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
@@ -24,18 +28,12 @@ import java.util.Objects;
  * Manages crash recovery and startup index rebuilding for ChronoCask.
  *
  * Responsibilities:
- * - Scans existing segments in logical order (ascending segment IDs).
+ * - Scans existing segments in logical order (using StorageManifest).
+ * - Leverages fast hint files for immutable segments when present.
  * - For each segment, verifies framing, magic bytes, versions, and CRC32C checksums.
- * - Handles incomplete crash tails:
- *     - If the very last (active) segment has an incomplete write or corruption at the file tail,
- *       the recovery protocol inspects whether subsequent bytes contain valid records. If corruption
- *       occurs strictly at the tail, the uncommitted tail is safely truncated.
- *     - If corruption occurs in the middle of a segment (with subsequent valid records) or in
- *       an immutable sealed segment, a {@link CorruptRecordException} is thrown to prevent silent data loss.
- * - Replays valid records into the provided {@link KeyDir}:
- *     - PUT records insert or update the {@link IndexEntry}.
- *     - DELETE tombstones remove the key from the index.
- * - Restores the highest sequence number so new writes continue monotonically.
+ * - Validates global monotonic sequence numbering across records.
+ * - Handles incomplete crash tails in the active segment via safe truncation.
+ * - Replays valid records into KeyDir.
  */
 public class RecoveryManager {
 
@@ -48,13 +46,6 @@ public class RecoveryManager {
         );
     }
 
-    /**
-     * Executes the recovery protocol and rebuilds the KeyDir index.
-     *
-     * @param keyDir the index (HeapKeyDir or OffHeapKeyDir) to rebuild
-     * @return summary statistics of the recovery
-     * @throws StorageException on unrecoverable corruption or I/O failure
-     */
     public RecoveryResult recover(KeyDir keyDir) throws StorageException {
         Objects.requireNonNull(keyDir, "keyDir cannot be null");
         long startTime = System.currentTimeMillis();
@@ -75,11 +66,39 @@ public class RecoveryManager {
                 activeSegment != null &&
                 segment.segmentId() == activeSegment.segmentId();
 
-            SegmentRecoveryResult segResult = recoverSegment(
-                segment,
-                keyDir,
-                isActive
-            );
+            SegmentRecoveryResult segResult = null;
+
+            // Try fast recovery using hint file for immutable segments
+            if (!isActive) {
+                Path hintPath = HintFileWriter.getHintFilePath(
+                    segmentManager.getBaseDir(),
+                    segment.segmentId()
+                );
+                if (Files.exists(hintPath)) {
+                    try {
+                        segResult = recoverFromHintFile(
+                            hintPath,
+                            segment.segmentId(),
+                            keyDir,
+                            highestSeqNum
+                        );
+                    } catch (Exception ignored) {
+                        // On hint file read error, fall back to full segment scan
+                        segResult = null;
+                    }
+                }
+            }
+
+            // Fallback or active segment scan
+            if (segResult == null) {
+                segResult = recoverSegment(
+                    segment,
+                    keyDir,
+                    isActive,
+                    highestSeqNum
+                );
+            }
+
             validRecords += segResult.validRecords();
             putRecords += segResult.putRecords();
             deleteRecords += segResult.deleteRecords();
@@ -104,24 +123,52 @@ public class RecoveryManager {
         );
     }
 
+    private SegmentRecoveryResult recoverFromHintFile(
+        Path hintPath,
+        int segmentId,
+        KeyDir keyDir,
+        long previousHighestSeq
+    ) throws IOException {
+        long[] counts = new long[3]; // [valid, highestSeq]
+        counts[1] = previousHighestSeq;
+
+        HintFileReader.read(hintPath, hint -> {
+            if (hint.sequenceNumber() <= counts[1] && counts[1] > 0) {
+                throw new CorruptRecordException(
+                    "Out-of-order sequence number in hint file " +
+                        hintPath +
+                        ": " +
+                        hint.sequenceNumber() +
+                        " <= " +
+                        counts[1]
+                );
+            }
+            counts[0]++; // valid
+            counts[1] = Math.max(counts[1], hint.sequenceNumber());
+            keyDir.put(hint.key(), hint.toIndexEntry());
+        });
+
+        return new SegmentRecoveryResult(counts[0], counts[0], 0, 0, counts[1]);
+    }
+
     private SegmentRecoveryResult recoverSegment(
         LogSegment segment,
         KeyDir keyDir,
-        boolean isActive
+        boolean isActive,
+        long previousHighestSeq
     ) {
         long validRecords = 0;
         long putRecords = 0;
         long deleteRecords = 0;
         long truncatedBytes = 0;
-        long highestSeqNum = 0;
+        long highestSeqNum = previousHighestSeq;
 
         Path path = segment.path();
         long currentOffset = 0;
         long segmentSize = segment.size();
 
-        // If the segment is empty, nothing to scan
         if (segmentSize == 0) {
-            return new SegmentRecoveryResult(0, 0, 0, 0, 0);
+            return new SegmentRecoveryResult(0, 0, 0, 0, previousHighestSeq);
         }
 
         try (
@@ -140,7 +187,6 @@ public class RecoveryManager {
                 // 1. Check if there are at least 28 bytes for a full header
                 if (remainingBytes < RecordHeader.HEADER_SIZE) {
                     if (isActive) {
-                        // Crash truncation at active segment tail
                         truncatedBytes = remainingBytes;
                         break;
                     } else {
@@ -175,7 +221,6 @@ public class RecoveryManager {
                             segmentSize
                         )
                     ) {
-                        // Truncate only if this corruption is strictly at the tail with no subsequent valid records
                         truncatedBytes = remainingBytes;
                         break;
                     } else {
@@ -195,7 +240,6 @@ public class RecoveryManager {
                 // 2. Check if the full payload exists
                 if (remainingBytes < totalRecordSize) {
                     if (isActive) {
-                        // Crash truncation in payload at active segment tail
                         truncatedBytes = remainingBytes;
                         break;
                     } else {
@@ -235,7 +279,6 @@ public class RecoveryManager {
                             segmentSize
                         )
                     ) {
-                        // Corrupt record strictly at the active tail
                         truncatedBytes = remainingBytes;
                         break;
                     } else {
@@ -250,11 +293,24 @@ public class RecoveryManager {
                     }
                 }
 
-                // 4. Update recovery state and KeyDir
-                validRecords++;
-                if (record.sequenceNumber() > highestSeqNum) {
-                    highestSeqNum = record.sequenceNumber();
+                // Validate monotonic sequence number ordering
+                if (
+                    record.sequenceNumber() <= highestSeqNum &&
+                    highestSeqNum > 0
+                ) {
+                    throw new CorruptRecordException(
+                        "Out-of-order sequence number in segment " +
+                            segment.segmentId() +
+                            ": " +
+                            record.sequenceNumber() +
+                            " <= " +
+                            highestSeqNum,
+                        currentOffset
+                    );
                 }
+
+                validRecords++;
+                highestSeqNum = record.sequenceNumber();
 
                 RecordLocation location = new RecordLocation(
                     segment.segmentId(),
@@ -286,7 +342,6 @@ public class RecoveryManager {
             );
         }
 
-        // If active segment had an incomplete crash tail, truncate to valid offset
         if (truncatedBytes > 0) {
             try {
                 segment.truncate(currentOffset);
@@ -310,10 +365,6 @@ public class RecoveryManager {
         );
     }
 
-    /**
-     * Checks whether valid records exist further ahead in the channel,
-     * which indicates middle-of-segment corruption rather than a crash truncation tail.
-     */
     private boolean hasValidRecordAhead(
         FileChannel channel,
         long fromOffset,
@@ -342,7 +393,6 @@ public class RecoveryManager {
                 ) {
                     int magic = scanBuf.getInt(i);
                     if (magic == RecordHeader.MAGIC) {
-                        // Found potential valid record header magic ahead
                         long candidateOffset = pos + i;
                         if (
                             candidateOffset + RecordHeader.HEADER_SIZE <=
@@ -367,11 +417,9 @@ public class RecoveryManager {
                                     channel.read(recBuf, candidateOffset);
                                     recBuf.flip();
                                     RecordCodec.decode(recBuf);
-                                    return true; // Valid record found ahead!
+                                    return true;
                                 }
-                            } catch (Exception ignored) {
-                                // Keep scanning
-                            }
+                            } catch (Exception ignored) {}
                         }
                     }
                 }

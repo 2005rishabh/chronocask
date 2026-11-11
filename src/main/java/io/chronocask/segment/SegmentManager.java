@@ -1,16 +1,17 @@
 package io.chronocask.segment;
 
 import io.chronocask.exception.StorageException;
+import io.chronocask.hint.HintFileWriter;
+import io.chronocask.manifest.ManifestManager;
+import io.chronocask.manifest.ManifestSegmentEntry;
+import io.chronocask.manifest.StorageManifest;
 import io.chronocask.record.Record;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -21,11 +22,11 @@ import java.util.regex.Pattern;
  * Manages the lifecycle of append-only log segments within a database directory.
  *
  * Responsibilities:
- * - Scans existing segments on startup in logical order
- * - Manages a single active writable segment and multiple immutable sealed segments
- * - Automatically rotates the active segment when it reaches the configured threshold
- * - Routes point reads to the appropriate segment
- * - Supports safe segment deletion for compaction
+ * - Scans existing segments using StorageManifest as the authoritative source of truth.
+ * - Manages a single active writable segment and multiple immutable sealed segments.
+ * - Automatically rotates the active segment when it reaches the configured threshold.
+ * - Routes point reads to the appropriate segment.
+ * - Supports atomic segment replacement (replaceSegments) for crash-safe compaction publication.
  */
 public class SegmentManager implements Closeable {
 
@@ -38,6 +39,7 @@ public class SegmentManager implements Closeable {
     private final Path baseDir;
     private final long maxSegmentSizeBytes;
     private final DurabilityMode defaultDurability;
+    private final ManifestManager manifestManager;
 
     private final ConcurrentNavigableMap<
         Integer,
@@ -46,6 +48,7 @@ public class SegmentManager implements Closeable {
     private final ReentrantLock writeLock = new ReentrantLock();
 
     private volatile LogSegment activeSegment;
+    private volatile int nextSegmentId = 1;
     private volatile boolean closed = false;
 
     private SegmentManager(
@@ -65,11 +68,9 @@ public class SegmentManager implements Closeable {
             defaultDurability,
             "defaultDurability cannot be null"
         );
+        this.manifestManager = new ManifestManager(baseDir);
     }
 
-    /**
-     * Initializes a SegmentManager in the given directory with default configuration.
-     */
     public static SegmentManager open(Path baseDir) throws IOException {
         return open(
             baseDir,
@@ -78,9 +79,6 @@ public class SegmentManager implements Closeable {
         );
     }
 
-    /**
-     * Initializes a SegmentManager with custom segment size threshold and durability mode.
-     */
     public static SegmentManager open(
         Path baseDir,
         long maxSegmentSizeBytes,
@@ -95,45 +93,18 @@ public class SegmentManager implements Closeable {
         return manager;
     }
 
-    /**
-     * Discovers existing segments or creates the initial active segment.
-     */
     private void initialize() throws IOException {
         Files.createDirectories(baseDir);
 
-        List<Integer> existingIds = new ArrayList<>();
-        try (
-            DirectoryStream<Path> stream = Files.newDirectoryStream(
-                baseDir,
-                "segment-*.log"
-            )
-        ) {
-            for (Path entry : stream) {
-                Integer segmentId = parseSegmentId(
-                    entry.getFileName().toString()
-                );
-                if (segmentId != null) {
-                    existingIds.add(segmentId);
-                }
-            }
-        }
+        StorageManifest manifest = manifestManager.load();
 
-        Collections.sort(existingIds);
+        if (manifest != null) {
+            // Manifest is authoritative: open segments recorded in manifest
+            int maxId = manifest.activeSegmentId();
 
-        if (existingIds.isEmpty()) {
-            // First time initialization: create segment-000001.log
-            int initialId = 1;
-            Path initialPath = baseDir.resolve(
-                formatSegmentFileName(initialId)
-            );
-            this.activeSegment = FileLogSegment.createActive(
-                initialPath,
-                initialId
-            );
-        } else {
-            // Open all earlier segments as sealed/immutable
-            for (int i = 0; i < existingIds.size() - 1; i++) {
-                int id = existingIds.get(i);
+            for (ManifestSegmentEntry entry : manifest.immutableSegments()) {
+                int id = entry.segmentId();
+                if (id > maxId) maxId = id;
                 Path path = baseDir.resolve(formatSegmentFileName(id));
                 LogSegment segment = FileLogSegment.openExisting(
                     path,
@@ -143,27 +114,123 @@ public class SegmentManager implements Closeable {
                 immutableSegments.put(id, segment);
             }
 
-            // Open the highest segment as the active segment
-            int activeId = existingIds.get(existingIds.size() - 1);
+            int activeId = manifest.activeSegmentId();
             Path activePath = baseDir.resolve(formatSegmentFileName(activeId));
             this.activeSegment = FileLogSegment.openExisting(
                 activePath,
                 activeId,
                 false
             );
+
+            this.nextSegmentId = maxId + 1;
+
+            // Clean up unreferenced/stray segment files (e.g. from interrupted compaction)
+            cleanStrayFiles(manifest);
+        } else {
+            // First time initialization or migrating un-manifested directory
+            List<Integer> existingIds = new ArrayList<>();
+            try (
+                DirectoryStream<Path> stream = Files.newDirectoryStream(
+                    baseDir,
+                    "segment-*.log"
+                )
+            ) {
+                for (Path entry : stream) {
+                    Integer segmentId = parseSegmentId(
+                        entry.getFileName().toString()
+                    );
+                    if (segmentId != null) {
+                        existingIds.add(segmentId);
+                    }
+                }
+            }
+
+            Collections.sort(existingIds);
+
+            if (existingIds.isEmpty()) {
+                int initialId = 1;
+                Path initialPath = baseDir.resolve(
+                    formatSegmentFileName(initialId)
+                );
+                this.activeSegment = FileLogSegment.createActive(
+                    initialPath,
+                    initialId
+                );
+                this.nextSegmentId = 2;
+
+                StorageManifest initialManifest = StorageManifest.initial(
+                    initialId
+                );
+                manifestManager.commit(initialManifest);
+            } else {
+                List<ManifestSegmentEntry> entries = new ArrayList<>();
+                for (int i = 0; i < existingIds.size() - 1; i++) {
+                    int id = existingIds.get(i);
+                    Path path = baseDir.resolve(formatSegmentFileName(id));
+                    LogSegment segment = FileLogSegment.openExisting(
+                        path,
+                        id,
+                        true
+                    );
+                    immutableSegments.put(id, segment);
+
+                    boolean hasHint = Files.exists(
+                        HintFileWriter.getHintFilePath(baseDir, id)
+                    );
+                    entries.add(ManifestSegmentEntry.normal(id, hasHint));
+                }
+
+                int activeId = existingIds.get(existingIds.size() - 1);
+                Path activePath = baseDir.resolve(
+                    formatSegmentFileName(activeId)
+                );
+                this.activeSegment = FileLogSegment.openExisting(
+                    activePath,
+                    activeId,
+                    false
+                );
+                this.nextSegmentId = activeId + 1;
+
+                StorageManifest migratedManifest = new StorageManifest(
+                    1L,
+                    activeId,
+                    entries
+                );
+                manifestManager.commit(migratedManifest);
+            }
         }
     }
 
-    /**
-     * Appends a record using the default durability mode, performing segment rotation if needed.
-     */
+    private void cleanStrayFiles(StorageManifest manifest) {
+        Set<Integer> validIds = manifest.allSegmentIds();
+        try (
+            DirectoryStream<Path> stream = Files.newDirectoryStream(
+                baseDir,
+                "segment-*.log"
+            )
+        ) {
+            for (Path entry : stream) {
+                Integer segId = parseSegmentId(entry.getFileName().toString());
+                if (segId != null && !validIds.contains(segId)) {
+                    Files.deleteIfExists(entry);
+                }
+            }
+        } catch (IOException ignored) {}
+    }
+
+    public int allocateSegmentId() {
+        writeLock.lock();
+        try {
+            return nextSegmentId++;
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     public RecordLocation append(Record record) throws IOException {
         return append(record, defaultDurability);
     }
 
-    /**
-     * Appends a record using the specified durability mode, performing segment rotation if needed.
-     */
     public RecordLocation append(Record record, DurabilityMode durability)
         throws IOException {
         Objects.requireNonNull(record, "record cannot be null");
@@ -173,8 +240,6 @@ public class SegmentManager implements Closeable {
         try {
             ensureOpen();
 
-            // Rotate if adding this record would exceed max segment size,
-            // unless activeSegment is currently empty (to accommodate records larger than max size)
             if (
                 activeSegment.size() > 0 &&
                 activeSegment.size() + record.totalSize() > maxSegmentSizeBytes
@@ -188,28 +253,115 @@ public class SegmentManager implements Closeable {
         }
     }
 
-    /**
-     * Rotates the active segment by sealing it, adding it to immutableSegments,
-     * and creating a new active segment with the next segment ID.
-     * Must be called while holding writeLock.
-     */
     private void rotateActiveSegment() throws IOException {
         activeSegment.seal();
         immutableSegments.put(activeSegment.segmentId(), activeSegment);
 
-        int nextSegmentId = activeSegment.segmentId() + 1;
-        Path nextSegmentPath = baseDir.resolve(
-            formatSegmentFileName(nextSegmentId)
-        );
+        int nextId = nextSegmentId++;
+        Path nextSegmentPath = baseDir.resolve(formatSegmentFileName(nextId));
         this.activeSegment = FileLogSegment.createActive(
             nextSegmentPath,
-            nextSegmentId
+            nextId
         );
+
+        // Durably publish to manifest
+        StorageManifest current = manifestManager.getCurrentManifest();
+        if (current != null) {
+            StorageManifest updated = current.withActiveSegmentRotation(nextId);
+            manifestManager.commit(updated);
+        }
     }
 
     /**
-     * Reads a record from the location's designated segment.
+     * Atomically replaces obsolete segments with newly compacted segments.
      */
+    public void replaceSegments(
+        Set<Integer> obsoleteSegmentIds,
+        List<LogSegment> replacementSegments,
+        List<ManifestSegmentEntry> replacementEntries
+    ) throws IOException {
+        writeLock.lock();
+        try {
+            ensureOpen();
+            Objects.requireNonNull(
+                obsoleteSegmentIds,
+                "obsoleteSegmentIds cannot be null"
+            );
+            Objects.requireNonNull(
+                replacementSegments,
+                "replacementSegments cannot be null"
+            );
+            Objects.requireNonNull(
+                replacementEntries,
+                "replacementEntries cannot be null"
+            );
+
+            // 1. Validate
+            for (int obsoleteId : obsoleteSegmentIds) {
+                if (
+                    activeSegment != null &&
+                    activeSegment.segmentId() == obsoleteId
+                ) {
+                    throw new IllegalStateException(
+                        "Cannot replace active segment: " + obsoleteId
+                    );
+                }
+                if (!immutableSegments.containsKey(obsoleteId)) {
+                    throw new IllegalArgumentException(
+                        "Obsolete segment not found in immutable segments: " +
+                            obsoleteId
+                    );
+                }
+            }
+            for (LogSegment rep : replacementSegments) {
+                if (!rep.isSealed()) {
+                    throw new IllegalArgumentException(
+                        "Replacement segment must be sealed: " + rep.segmentId()
+                    );
+                }
+            }
+
+            // 2. Ensure replacement segments are durably forced to disk
+            for (LogSegment rep : replacementSegments) {
+                rep.flush(true);
+            }
+
+            // 3. Atomically publish updated manifest
+            StorageManifest current = manifestManager.getCurrentManifest();
+            StorageManifest updated = current.withReplacements(
+                obsoleteSegmentIds,
+                replacementEntries
+            );
+            manifestManager.commit(updated);
+
+            // 4. Update in-memory segment registry
+            List<LogSegment> toDelete = new ArrayList<>();
+            for (int obsoleteId : obsoleteSegmentIds) {
+                LogSegment removed = immutableSegments.remove(obsoleteId);
+                if (removed != null) {
+                    toDelete.add(removed);
+                }
+            }
+            for (LogSegment rep : replacementSegments) {
+                immutableSegments.put(rep.segmentId(), rep);
+            }
+
+            // 5. Delete obsolete files after publication is durable
+            for (LogSegment obsolete : toDelete) {
+                try {
+                    obsolete.delete();
+                    Path hintPath = HintFileWriter.getHintFilePath(
+                        baseDir,
+                        obsolete.segmentId()
+                    );
+                    Files.deleteIfExists(hintPath);
+                } catch (IOException ignored) {}
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     public Record read(RecordLocation location) throws IOException {
         Objects.requireNonNull(location, "location cannot be null");
         ensureOpen();
@@ -223,9 +375,6 @@ public class SegmentManager implements Closeable {
         return segment.read(location);
     }
 
-    /**
-     * Retrieves a segment by its ID (active or immutable).
-     */
     public LogSegment getSegment(int segmentId) {
         LogSegment currentActive = this.activeSegment;
         if (currentActive != null && currentActive.segmentId() == segmentId) {
@@ -234,24 +383,41 @@ public class SegmentManager implements Closeable {
         return immutableSegments.get(segmentId);
     }
 
-    /**
-     * Returns an unmodifiable list of all immutable segments in ascending segmentId order.
-     */
     public List<LogSegment> getImmutableSegments() {
+        StorageManifest manifest = manifestManager.getCurrentManifest();
+        if (manifest != null) {
+            List<LogSegment> ordered = new ArrayList<>();
+            for (ManifestSegmentEntry entry : manifest.immutableSegments()) {
+                LogSegment seg = immutableSegments.get(entry.segmentId());
+                if (seg != null) {
+                    ordered.add(seg);
+                }
+            }
+            return Collections.unmodifiableList(ordered);
+        }
         return List.copyOf(immutableSegments.values());
     }
 
-    /**
-     * Returns the current active segment.
-     */
     public LogSegment getActiveSegment() {
         return activeSegment;
     }
 
-    /**
-     * Returns all open segments in logical order (immutable segments sorted, followed by active).
-     */
     public List<LogSegment> getAllSegments() {
+        StorageManifest manifest = manifestManager.getCurrentManifest();
+        if (manifest != null) {
+            List<LogSegment> ordered = new ArrayList<>();
+            for (ManifestSegmentEntry entry : manifest.immutableSegments()) {
+                LogSegment seg = immutableSegments.get(entry.segmentId());
+                if (seg != null) {
+                    ordered.add(seg);
+                }
+            }
+            if (activeSegment != null) {
+                ordered.add(activeSegment);
+            }
+            return Collections.unmodifiableList(ordered);
+        }
+
         List<LogSegment> all = new ArrayList<>(immutableSegments.values());
         LogSegment currentActive = this.activeSegment;
         if (
@@ -263,10 +429,6 @@ public class SegmentManager implements Closeable {
         return Collections.unmodifiableList(all);
     }
 
-    /**
-     * Deletes an immutable segment file and removes it from the manager.
-     * Active segments cannot be deleted.
-     */
     public void deleteSegment(int segmentId) throws IOException {
         writeLock.lock();
         try {
@@ -281,20 +443,22 @@ public class SegmentManager implements Closeable {
             LogSegment segment = immutableSegments.remove(segmentId);
             if (segment != null) {
                 segment.delete();
+                Path hintPath = HintFileWriter.getHintFilePath(
+                    baseDir,
+                    segmentId
+                );
+                Files.deleteIfExists(hintPath);
             }
         } finally {
             writeLock.unlock();
         }
     }
 
-    /**
-     * Flushes the active segment.
-     */
     public void flush() throws IOException {
         writeLock.lock();
         try {
             if (!closed && activeSegment != null) {
-                activeSegment.flush(false);
+                activeSegment.flush(true);
             }
         } finally {
             writeLock.unlock();
@@ -319,6 +483,14 @@ public class SegmentManager implements Closeable {
         } finally {
             writeLock.unlock();
         }
+    }
+
+    public StorageManifest getManifest() {
+        return manifestManager.getCurrentManifest();
+    }
+
+    public ManifestManager getManifestManager() {
+        return manifestManager;
     }
 
     public Path getBaseDir() {

@@ -1,9 +1,9 @@
 package io.chronocask.api;
 
+import io.chronocask.compaction.CompactionResult;
 import io.chronocask.exception.StorageException;
 import io.chronocask.recovery.RecoveryResult;
 import io.chronocask.storage.StorageEngine;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +21,7 @@ import java.util.function.BiConsumer;
  *     store.put("user:101", "Rishabh");
  *     String val = store.get("user:101");
  *     store.delete("user:101");
+ *     store.compact();
  * }
  * }</pre>
  */
@@ -47,7 +48,10 @@ public final class ChronoCask implements Closeable {
             StorageEngine engine = StorageEngine.open(config);
             return new ChronoCask(engine);
         } catch (IOException e) {
-            throw new StorageException("Failed to open ChronoCask: " + e.getMessage(), e);
+            throw new StorageException(
+                "Failed to open ChronoCask: " + e.getMessage(),
+                e
+            );
         }
     }
 
@@ -66,7 +70,11 @@ public final class ChronoCask implements Closeable {
     public void put(String key, String value, WriteOptions options) {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(value, "value cannot be null");
-        put(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), options);
+        put(
+            key.getBytes(StandardCharsets.UTF_8),
+            value.getBytes(StandardCharsets.UTF_8),
+            options
+        );
     }
 
     /**
@@ -75,7 +83,9 @@ public final class ChronoCask implements Closeable {
     public String get(String key) {
         Objects.requireNonNull(key, "key cannot be null");
         byte[] valueBytes = get(key.getBytes(StandardCharsets.UTF_8));
-        return valueBytes != null ? new String(valueBytes, StandardCharsets.UTF_8) : null;
+        return valueBytes != null
+            ? new String(valueBytes, StandardCharsets.UTF_8)
+            : null;
     }
 
     /**
@@ -171,6 +181,23 @@ public final class ChronoCask implements Closeable {
     // --- Management & Diagnostics ---
 
     /**
+     * Executes a synchronous compaction cycle on immutable log segments,
+     * reclaiming storage space occupied by outdated records and tombstones.
+     *
+     * @return summary statistics of the compaction cycle
+     */
+    public CompactionResult compact() {
+        try {
+            return engine.compact();
+        } catch (IOException e) {
+            throw new StorageException(
+                "Failed to run compaction: " + e.getMessage(),
+                e
+            );
+        }
+    }
+
+    /**
      * Total number of active keys in the store.
      */
     public long size() {
@@ -200,10 +227,12 @@ public final class ChronoCask implements Closeable {
      */
     public void forEach(BiConsumer<String, String> action) {
         Objects.requireNonNull(action, "action cannot be null");
-        engine.forEach((k, v) -> action.accept(
+        engine.forEach((k, v) ->
+            action.accept(
                 new String(k, StandardCharsets.UTF_8),
                 new String(v, StandardCharsets.UTF_8)
-        ));
+            )
+        );
     }
 
     /**

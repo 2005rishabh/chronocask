@@ -2,6 +2,8 @@ package io.chronocask.storage;
 
 import io.chronocask.api.ChronoCaskConfig;
 import io.chronocask.api.WriteOptions;
+import io.chronocask.compaction.CompactionManager;
+import io.chronocask.compaction.CompactionResult;
 import io.chronocask.exception.StorageException;
 import io.chronocask.index.HeapKeyDir;
 import io.chronocask.index.IndexEntry;
@@ -13,7 +15,6 @@ import io.chronocask.recovery.RecoveryResult;
 import io.chronocask.segment.DurabilityMode;
 import io.chronocask.segment.RecordLocation;
 import io.chronocask.segment.SegmentManager;
-
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Objects;
@@ -22,7 +23,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 
 /**
- * StorageEngine orchestrates the segment manager, KeyDir index, and recovery manager.
+ * StorageEngine orchestrates the segment manager, KeyDir index, recovery manager, and compaction.
  *
  * It serves as the core engine for all read/write operations, coordinating concurrency,
  * monotonic sequence numbering, and lifecycle management.
@@ -34,59 +35,92 @@ public class StorageEngine implements Closeable {
     private final KeyDir keyDir;
     private final RecoveryResult recoveryResult;
     private final AtomicLong sequenceNumber;
+    private final CompactionManager compactionManager;
 
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();
-    private final ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();
+    private final ReentrantReadWriteLock.WriteLock writeLock =
+        rwLock.writeLock();
 
     private volatile boolean closed = false;
 
-    private StorageEngine(ChronoCaskConfig config, SegmentManager segmentManager, KeyDir keyDir, RecoveryResult recoveryResult) {
+    private StorageEngine(
+        ChronoCaskConfig config,
+        SegmentManager segmentManager,
+        KeyDir keyDir,
+        RecoveryResult recoveryResult
+    ) {
         this.config = Objects.requireNonNull(config, "config cannot be null");
-        this.segmentManager = Objects.requireNonNull(segmentManager, "segmentManager cannot be null");
+        this.segmentManager = Objects.requireNonNull(
+            segmentManager,
+            "segmentManager cannot be null"
+        );
         this.keyDir = Objects.requireNonNull(keyDir, "keyDir cannot be null");
-        this.recoveryResult = Objects.requireNonNull(recoveryResult, "recoveryResult cannot be null");
-        this.sequenceNumber = new AtomicLong(recoveryResult.highestSequenceNumber());
+        this.recoveryResult = Objects.requireNonNull(
+            recoveryResult,
+            "recoveryResult cannot be null"
+        );
+        this.sequenceNumber = new AtomicLong(
+            recoveryResult.highestSequenceNumber()
+        );
+        this.compactionManager = new CompactionManager(
+            config.dataDir(),
+            segmentManager,
+            config.maxSegmentSizeBytes()
+        );
     }
 
     /**
      * Initializes and starts a StorageEngine according to the given configuration.
      * Replays existing disk segments to restore index state before returning.
      */
-    public static StorageEngine open(ChronoCaskConfig config) throws IOException {
+    public static StorageEngine open(ChronoCaskConfig config)
+        throws IOException {
         Objects.requireNonNull(config, "config cannot be null");
 
         SegmentManager segmentManager = SegmentManager.open(
-                config.dataDir(),
-                config.maxSegmentSizeBytes(),
-                config.defaultDurability()
+            config.dataDir(),
+            config.maxSegmentSizeBytes(),
+            config.defaultDurability()
         );
 
         KeyDir keyDir = config.offHeapIndex()
-                ? new OffHeapKeyDir(config.initialIndexCapacity(), config.initialKeySlabBytes())
-                : new HeapKeyDir(config.initialIndexCapacity());
+            ? new OffHeapKeyDir(
+                  config.initialIndexCapacity(),
+                  config.initialKeySlabBytes()
+              )
+            : new HeapKeyDir(config.initialIndexCapacity());
 
         try {
-            RecoveryManager recoveryManager = new RecoveryManager(segmentManager);
+            RecoveryManager recoveryManager = new RecoveryManager(
+                segmentManager
+            );
             RecoveryResult recoveryResult = recoveryManager.recover(keyDir);
-            return new StorageEngine(config, segmentManager, keyDir, recoveryResult);
+            return new StorageEngine(
+                config,
+                segmentManager,
+                keyDir,
+                recoveryResult
+            );
         } catch (Exception e) {
             try {
                 keyDir.close();
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
             try {
                 segmentManager.close();
-            } catch (Exception ignored) {
-            }
-            throw new StorageException("Failed to open StorageEngine: " + e.getMessage(), e);
+            } catch (Exception ignored) {}
+            throw new StorageException(
+                "Failed to open StorageEngine: " + e.getMessage(),
+                e
+            );
         }
     }
 
     /**
      * Puts a key-value pair into the store.
      */
-    public void put(byte[] key, byte[] value, WriteOptions options) throws IOException {
+    public void put(byte[] key, byte[] value, WriteOptions options)
+        throws IOException {
         Objects.requireNonNull(key, "key cannot be null");
         Objects.requireNonNull(value, "value cannot be null");
 
@@ -155,6 +189,14 @@ public class StorageEngine implements Closeable {
     }
 
     /**
+     * Performs synchronous log compaction on immutable segments.
+     */
+    public CompactionResult compact() throws IOException {
+        ensureOpen();
+        return compactionManager.compact(keyDir, writeLock);
+    }
+
+    /**
      * Returns true if the key exists in the active index.
      */
     public boolean containsKey(byte[] key) {
@@ -216,7 +258,10 @@ public class StorageEngine implements Closeable {
                     Record record = segmentManager.read(entry.location());
                     action.accept(key, record.value());
                 } catch (IOException e) {
-                    throw new StorageException("Failed to read record for key during forEach", e);
+                    throw new StorageException(
+                        "Failed to read record for key during forEach",
+                        e
+                    );
                 }
             });
         } finally {
@@ -257,6 +302,10 @@ public class StorageEngine implements Closeable {
 
     public KeyDir getKeyDir() {
         return keyDir;
+    }
+
+    public CompactionManager getCompactionManager() {
+        return compactionManager;
     }
 
     public long currentSequenceNumber() {
