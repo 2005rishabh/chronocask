@@ -20,8 +20,8 @@ import java.util.concurrent.TimeUnit;
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
-@Warmup(iterations = 2, time = 1, timeUnit = TimeUnit.SECONDS)
-@Measurement(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
+@Warmup(iterations = 2, time = 2, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 3, time = 2, timeUnit = TimeUnit.SECONDS)
 @Fork(1)
 public class KeyDirBenchmark {
 
@@ -44,10 +44,7 @@ public class KeyDirBenchmark {
             pregeneratedKeys[i] = ("benchmark:key:namespace:" + i).getBytes(StandardCharsets.UTF_8);
             pregeneratedEntries[i] = new IndexEntry(1, i * 64L, 64, 16, i + 1);
         }
-    }
 
-    @Setup(Level.Iteration)
-    public void setupIteration() {
         if ("OFF_HEAP".equals(indexType)) {
             keyDir = new OffHeapKeyDir(keyCount * 2, 4 * 1024 * 1024L);
         } else {
@@ -60,8 +57,8 @@ public class KeyDirBenchmark {
         }
     }
 
-    @TearDown(Level.Iteration)
-    public void tearDownIteration() {
+    @TearDown(Level.Trial)
+    public void tearDownTrial() {
         if (keyDir != null) {
             keyDir.close();
         }

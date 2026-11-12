@@ -46,10 +46,13 @@ public class StorageEngineBenchmark {
         boolean offHeap = "OFF_HEAP".equals(indexType);
         DurabilityMode dur = "SYNC".equals(durability) ? DurabilityMode.SYNC : DurabilityMode.ASYNC;
 
+        // Large segment threshold to avoid benchmark-phase continuous rotation overhead
         ChronoCaskConfig config = ChronoCaskConfig.builder(tempDir)
                 .offHeapIndex(offHeap)
                 .defaultDurability(dur)
-                .maxSegmentSizeBytes(64 * 1024 * 1024L)
+                .maxSegmentSizeBytes(512 * 1024 * 1024L)
+                .initialIndexCapacity(32768)
+                .initialKeySlabBytes(16 * 1024 * 1024L)
                 .build();
 
         store = ChronoCask.open(config);
