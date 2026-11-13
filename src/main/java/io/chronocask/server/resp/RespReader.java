@@ -20,6 +20,14 @@ public final class RespReader {
     }
 
     /**
+     * Returns true if there are unread bytes already buffered in the underlying stream.
+     * Used for smart pipelined batch coalescing to avoid redundant write syscalls.
+     */
+    public boolean hasBufferedBytes() throws IOException {
+        return in.available() > 0;
+    }
+
+    /**
      * Reads the next complete RespValue from the stream.
      * Returns null if end of stream is reached before reading any byte.
      *
@@ -47,21 +55,34 @@ public final class RespReader {
         if (length < 0) {
             return RespValue.NULL_BULK_STRING;
         }
-        if (length > 512 * 1024 * 1024L) { // 512MB max bulk string protection
+        if (length > 512 * 1024 * 1024L) {
+            // 512MB max bulk string protection
             throw new IOException("Bulk string exceeds 512MB limit: " + length);
         }
 
         int len = (int) length;
         byte[] buffer = in.readNBytes(len);
         if (buffer.length < len) {
-            throw new EOFException("Unexpected EOF while reading bulk string data (expected " + len + ", got " + buffer.length + ")");
+            throw new EOFException(
+                "Unexpected EOF while reading bulk string data (expected " +
+                    len +
+                    ", got " +
+                    buffer.length +
+                    ")"
+            );
         }
 
         // Read trailing CRLF
         int cr = in.read();
         int lf = in.read();
         if (cr != '\r' || lf != '\n') {
-            throw new IOException("Protocol error: expected CRLF after bulk string, found [" + cr + ", " + lf + "]");
+            throw new IOException(
+                "Protocol error: expected CRLF after bulk string, found [" +
+                    cr +
+                    ", " +
+                    lf +
+                    "]"
+            );
         }
 
         return RespValue.bulkString(buffer);
@@ -77,7 +98,9 @@ public final class RespReader {
         for (int i = 0; i < count; i++) {
             RespValue val = readValue();
             if (val == null) {
-                throw new EOFException("Unexpected EOF while parsing RESP array elements");
+                throw new EOFException(
+                    "Unexpected EOF while parsing RESP array elements"
+                );
             }
             elements.add(val);
         }

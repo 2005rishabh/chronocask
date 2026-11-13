@@ -56,6 +56,8 @@ public final class CommandHandler {
                 case "DBSIZE" -> handleDbSize();
                 case "KEYS" -> handleKeys(elements);
                 case "INFO" -> handleInfo();
+                case "CONFIG" -> handleConfig(elements);
+                case "CLIENT" -> handleClient(elements);
                 case "COMPACT" -> handleCompact();
                 case "SYNC" -> handleSync();
                 case "COMMAND" -> handleCommandDocs();
@@ -222,6 +224,49 @@ public final class CommandHandler {
         }
 
         return CommandResult.reply(RespValue.bulkString(sb.toString()));
+    }
+
+    private CommandResult handleConfig(List<RespValue> args) {
+        // args may be [CONFIG, GET, save] or [GET, save]
+        int offset =
+            args.size() > 0 && "CONFIG".equalsIgnoreCase(args.get(0).asString())
+                ? 1
+                : 0;
+        if (
+            args.size() >= offset + 2 &&
+            "GET".equalsIgnoreCase(args.get(offset).asString())
+        ) {
+            String param = args.get(offset + 1).asString();
+            if (param != null) {
+                String p = param.toLowerCase(Locale.ROOT);
+                if (p.contains("save")) {
+                    return CommandResult.reply(
+                        RespValue.array(
+                            List.of(
+                                RespValue.bulkString("save"),
+                                RespValue.bulkString("")
+                            )
+                        )
+                    );
+                }
+                if (p.contains("appendonly")) {
+                    return CommandResult.reply(
+                        RespValue.array(
+                            List.of(
+                                RespValue.bulkString("appendonly"),
+                                RespValue.bulkString("yes")
+                            )
+                        )
+                    );
+                }
+            }
+            return CommandResult.reply(RespValue.array(List.of()));
+        }
+        return CommandResult.reply(RespValue.simpleString("OK"));
+    }
+
+    private CommandResult handleClient(List<RespValue> args) {
+        return CommandResult.reply(RespValue.OK);
     }
 
     private CommandResult handleCompact() {

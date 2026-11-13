@@ -6,7 +6,6 @@ import io.chronocask.server.command.CommandResult;
 import io.chronocask.server.resp.RespReader;
 import io.chronocask.server.resp.RespValue;
 import io.chronocask.server.resp.RespWriter;
-
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -29,6 +28,7 @@ public final class ChronoCaskServer implements Closeable {
 
     public static final String DEFAULT_HOST = "127.0.0.1";
     public static final int DEFAULT_PORT = 7379;
+    private static final int BUFFER_SIZE = 64 * 1024; // 64 KB socket/stream buffers
 
     private final ChronoCask store;
     private final String host;
@@ -56,7 +56,11 @@ public final class ChronoCaskServer implements Closeable {
         return create(store, DEFAULT_HOST, port);
     }
 
-    public static ChronoCaskServer create(ChronoCask store, String host, int port) {
+    public static ChronoCaskServer create(
+        ChronoCask store,
+        String host,
+        int port
+    ) {
         return new ChronoCaskServer(store, host, port);
     }
 
@@ -76,7 +80,9 @@ public final class ChronoCaskServer implements Closeable {
         virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
         running.set(true);
 
-        acceptThread = Thread.ofVirtual().name("chronocask-accept-", boundPort).start(this::acceptLoop);
+        acceptThread = Thread.ofVirtual()
+            .name("chronocask-accept-", boundPort)
+            .start(this::acceptLoop);
     }
 
     private void acceptLoop() {
@@ -84,6 +90,8 @@ public final class ChronoCaskServer implements Closeable {
             try {
                 Socket clientSocket = serverSocket.accept();
                 clientSocket.setTcpNoDelay(true);
+                clientSocket.setReceiveBufferSize(BUFFER_SIZE);
+                clientSocket.setSendBufferSize(BUFFER_SIZE);
                 virtualThreadExecutor.submit(() -> handleClient(clientSocket));
             } catch (SocketException se) {
                 // Server socket closed during shutdown
@@ -97,10 +105,23 @@ public final class ChronoCaskServer implements Closeable {
     }
 
     private void handleClient(Socket socket) {
-        try (socket;
-             BufferedInputStream in = new BufferedInputStream(socket.getInputStream(), 8192);
-             BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream(), 8192)) {
+        try {
+            socket.setTcpNoDelay(true);
+            socket.setReceiveBufferSize(BUFFER_SIZE);
+            socket.setSendBufferSize(BUFFER_SIZE);
+        } catch (SocketException ignored) {}
 
+        try (
+            socket;
+            BufferedInputStream in = new BufferedInputStream(
+                socket.getInputStream(),
+                BUFFER_SIZE
+            );
+            BufferedOutputStream out = new BufferedOutputStream(
+                socket.getOutputStream(),
+                BUFFER_SIZE
+            )
+        ) {
             RespReader reader = new RespReader(in);
             RespWriter writer = new RespWriter(out);
 
@@ -112,7 +133,11 @@ public final class ChronoCaskServer implements Closeable {
 
                 CommandResult result = commandHandler.execute(request);
                 writer.write(result.response());
-                writer.flush();
+
+                // Smart batch flush: Only flush to the OS kernel when the pipelined batch in the input buffer is drained
+                if (!reader.hasBufferedBytes() || result.closeConnection()) {
+                    writer.flush();
+                }
 
                 if (result.closeConnection()) {
                     break;
@@ -150,8 +175,7 @@ public final class ChronoCaskServer implements Closeable {
             if (serverSocket != null && !serverSocket.isClosed()) {
                 serverSocket.close();
             }
-        } catch (IOException ignored) {
-        }
+        } catch (IOException ignored) {}
 
         if (acceptThread != null) {
             acceptThread.interrupt();
