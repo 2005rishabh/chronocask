@@ -1,12 +1,12 @@
 # ChronoCask
 
-> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, Safe Segment Compaction, and JMH Benchmarking.
+> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, Safe Segment Compaction, JMH Benchmarking, and Standalone Redis/RESP TCP Server.
 
 ---
 
 ## 1. Overview
 
-ChronoCask is an embedded persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, deterministic crash recovery, and crash-safe segment compaction.
+ChronoCask is an embedded and standalone persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, deterministic crash recovery, crash-safe segment compaction, and high-concurrency client-server networking with **Java 25 Virtual Threads**.
 
 ### Key Architectural Highlights
 
@@ -16,13 +16,65 @@ ChronoCask is an embedded persistent key-value storage engine inspired by the Bi
 - **Authoritative Storage Manifest**: Persistently describes the authoritative generation of active and immutable segments (`MANIFEST`), ensuring deterministic crash consistency without directory file heuristics.
 - **Fast Startup via Hint Files**: Generates durable `.hint` files for sealed segments, enabling sub-millisecond recovery by reading index metadata without loading full payload values.
 - **Safe Prefix Compaction**: Enforces a strict contiguous-prefix boundary rule starting from the oldest segment to eliminate superseded records and tombstones without risking deleted key resurrection.
+- **Standalone Redis-Compatible Server**: Speaks the standard Redis Serialization Protocol (RESP2), allowing any Redis client (`redis-cli`, Python, Jedis, Go, Node.js) to interact directly with ChronoCask.
+- **Virtual Thread Concurrency**: Powered by Java 25 virtual threads (`Thread.ofVirtual()`), handling thousands of concurrent client connections with near-zero memory footprint and zero thread-pool exhaustion.
 - **Rigorous JMH Performance Benchmarking**: Built-in microbenchmark harness evaluating Heap vs. Off-Heap index performance, record framing throughput, and end-to-end storage engine I/O.
 
 ---
 
-## 2. Quickstart & Client API
+## 2. Standalone Redis/RESP Server (Milestone 8)
 
-ChronoCask provides an intuitive, high-performance embedded Java API:
+ChronoCask includes a standalone high-concurrency TCP server speaking the standard Redis protocol:
+
+### Starting the Server
+
+```bash
+# Launch ChronoCask server on port 7379 with off-heap index enabled
+java -cp "target/classes:$(mvn dependency:build-classpath -q -Dmdep.outputFile=/dev/stdout)" \
+     io.chronocask.server.ChronoCaskServerMain --port 7379 --dir ./chronocask-data
+```
+
+### Interacting via `redis-cli` or `nc`
+
+Any standard Redis client can connect seamlessly:
+
+```bash
+$ redis-cli -p 7379
+127.0.0.1:7379> PING
+PONG
+127.0.0.1:7379> SET user:101 "Rishabh"
+OK
+127.0.0.1:7379> GET user:101
+"Rishabh"
+127.0.0.1:7379> EXISTS user:101
+(integer) 1
+127.0.0.1:7379> DBSIZE
+(integer) 1
+127.0.0.1:7379> INFO
+# Server
+chronocask_version:0.1.0
+java_version:25
+os_name:Linux
+uptime_in_seconds:12
+# Storage
+index_type:off-heap
+total_keys:1
+active_segment_id:1
+127.0.0.1:7379> COMPACT
+OK compacted 0 segments into 0 segment(s), reclaimed 0 bytes
+127.0.0.1:7379> DEL user:101
+(integer) 1
+127.0.0.1:7379> GET user:101
+(nil)
+127.0.0.1:7379> QUIT
+OK
+```
+
+---
+
+## 3. Embedded Java Client API
+
+ChronoCask can also be used directly as an embedded database library:
 
 ```java
 import io.chronocask.api.ChronoCask;
@@ -61,7 +113,7 @@ try (ChronoCask store = ChronoCask.open(Path.of("./data"))) {
 
 ---
 
-## 3. Directory Layout & Persistence Model
+## 4. Directory Layout & Persistence Model
 
 ```text
 chronocask-data/
@@ -79,7 +131,7 @@ chronocask-data/
 
 ---
 
-## 4. Performance Benchmarks (Milestone 7)
+## 5. Performance Benchmarks (Milestone 7)
 
 Microbenchmarks run on **OpenJDK 25 (Ubuntu x86_64)** via the OpenJDK JMH harness:
 
@@ -105,13 +157,13 @@ Microbenchmarks run on **OpenJDK 25 (Ubuntu x86_64)** via the OpenJDK JMH harnes
 
 ---
 
-## 5. Requirements, Build & Running Benchmarks
+## 6. Requirements & Build Verification
 
 - **Java Development Kit (JDK)**: Java 25
 - **Build Tool**: Apache Maven 3.8+
 
 ```bash
-# Clean and run full unit/integration test suite (58 tests)
+# Clean and run full unit/integration test suite (75 tests)
 mvn clean test
 
 # Run the JMH benchmark suite
