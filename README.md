@@ -1,5 +1,9 @@
 # ChronoCask
 
+![Build Status](https://github.com/2005rishabh/chronocask/actions/workflows/ci.yml/badge.svg)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Java 25](https://img.shields.io/badge/Java-25-orange.svg)](https://openjdk.org/projects/jdk/25/)
+
 > **ChronoCask**: A High-Performance Distributed & Embedded Key-Value Storage Engine in Java 25 featuring Log-Structured Append-Only Segments, Zero-GC Off-Heap Indexing via Foreign Function & Memory (FFM), Crash Recovery with Bit-Rot Detection, Online Segment Compaction, RESP2 Redis Protocol Server with Virtual Threads, and Raft Distributed Consensus.
 
 ---
