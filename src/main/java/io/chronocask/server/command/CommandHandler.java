@@ -2,9 +2,12 @@ package io.chronocask.server.command;
 
 import io.chronocask.api.ChronoCask;
 import io.chronocask.compaction.CompactionResult;
+import io.chronocask.raft.DistributedChronoCask;
+import io.chronocask.raft.NotLeaderException;
+import io.chronocask.raft.RaftNode;
+import io.chronocask.raft.model.NodeId;
 import io.chronocask.server.resp.RespType;
 import io.chronocask.server.resp.RespValue;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -13,15 +16,27 @@ import java.util.Locale;
 import java.util.Objects;
 
 /**
- * Dispatches parsed RESP commands to the underlying ChronoCask storage engine.
+ * Dispatches parsed RESP commands to either a standalone ChronoCask storage engine
+ * or a distributed Raft-backed ChronoCask cluster node.
  */
 public final class CommandHandler {
 
     private final ChronoCask store;
+    private final DistributedChronoCask distributedStore;
     private final Instant startTime;
 
     public CommandHandler(ChronoCask store) {
         this.store = Objects.requireNonNull(store, "store cannot be null");
+        this.distributedStore = null;
+        this.startTime = Instant.now();
+    }
+
+    public CommandHandler(DistributedChronoCask distributedStore) {
+        this.distributedStore = Objects.requireNonNull(
+            distributedStore,
+            "distributedStore cannot be null"
+        );
+        this.store = distributedStore.getStore();
         this.startTime = Instant.now();
     }
 
@@ -60,12 +75,20 @@ public final class CommandHandler {
                 case "CLIENT" -> handleClient(elements);
                 case "COMPACT" -> handleCompact();
                 case "SYNC" -> handleSync();
+                case "RAFT", "CLUSTER" -> handleRaftStatus();
                 case "COMMAND" -> handleCommandDocs();
                 case "QUIT" -> CommandResult.quit();
                 default -> CommandResult.reply(
                     RespValue.error("ERR unknown command '" + cmdName + "'")
                 );
             };
+        } catch (NotLeaderException nle) {
+            NodeId lId = nle.getLeaderId();
+            return CommandResult.reply(
+                RespValue.error(
+                    "NOT_LEADER " + (lId != null ? lId.id() : "unknown")
+                )
+            );
         } catch (Exception e) {
             return CommandResult.reply(
                 RespValue.error(
@@ -110,8 +133,33 @@ public final class CommandHandler {
             );
         }
 
-        store.put(key, value);
-        return CommandResult.reply(RespValue.OK);
+        try {
+            if (distributedStore != null) {
+                distributedStore.put(key, value);
+            } else {
+                store.put(key, value);
+            }
+            return CommandResult.reply(RespValue.OK);
+        } catch (NotLeaderException nle) {
+            NodeId lId = nle.getLeaderId();
+            return CommandResult.reply(
+                RespValue.error(
+                    "NOT_LEADER " + (lId != null ? lId.id() : "unknown")
+                )
+            );
+        } catch (Exception e) {
+            if (e.getCause() instanceof NotLeaderException nle) {
+                NodeId lId = nle.getLeaderId();
+                return CommandResult.reply(
+                    RespValue.error(
+                        "NOT_LEADER " + (lId != null ? lId.id() : "unknown")
+                    )
+                );
+            }
+            return CommandResult.reply(
+                RespValue.error("ERR " + e.getMessage())
+            );
+        }
     }
 
     private CommandResult handleGet(List<RespValue> args) {
@@ -128,7 +176,10 @@ public final class CommandHandler {
             return CommandResult.reply(RespValue.NULL_BULK_STRING);
         }
 
-        byte[] val = store.get(key);
+        byte[] val =
+            distributedStore != null
+                ? distributedStore.get(key)
+                : store.get(key);
         if (val == null) {
             return CommandResult.reply(RespValue.NULL_BULK_STRING);
         }
@@ -144,14 +195,41 @@ public final class CommandHandler {
             );
         }
 
-        long deletedCount = 0;
-        for (int i = 1; i < args.size(); i++) {
-            byte[] key = args.get(i).bytes();
-            if (key != null && store.delete(key)) {
-                deletedCount++;
+        try {
+            long deletedCount = 0;
+            for (int i = 1; i < args.size(); i++) {
+                byte[] key = args.get(i).bytes();
+                if (key != null) {
+                    boolean removed =
+                        distributedStore != null
+                            ? distributedStore.delete(key)
+                            : store.delete(key);
+                    if (removed) {
+                        deletedCount++;
+                    }
+                }
             }
+            return CommandResult.reply(RespValue.integer(deletedCount));
+        } catch (NotLeaderException nle) {
+            NodeId lId = nle.getLeaderId();
+            return CommandResult.reply(
+                RespValue.error(
+                    "NOT_LEADER " + (lId != null ? lId.id() : "unknown")
+                )
+            );
+        } catch (Exception e) {
+            if (e.getCause() instanceof NotLeaderException nle) {
+                NodeId lId = nle.getLeaderId();
+                return CommandResult.reply(
+                    RespValue.error(
+                        "NOT_LEADER " + (lId != null ? lId.id() : "unknown")
+                    )
+                );
+            }
+            return CommandResult.reply(
+                RespValue.error("ERR " + e.getMessage())
+            );
         }
-        return CommandResult.reply(RespValue.integer(deletedCount));
     }
 
     private CommandResult handleExists(List<RespValue> args) {
@@ -178,7 +256,6 @@ public final class CommandHandler {
     }
 
     private CommandResult handleKeys(List<RespValue> args) {
-        // Collect all keys currently in the index
         List<RespValue> keysList = new ArrayList<>();
         store.forEachBytes((key, val) ->
             keysList.add(RespValue.bulkString(key))
@@ -187,7 +264,7 @@ public final class CommandHandler {
     }
 
     private CommandResult handleInfo() {
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(512);
         long uptime = Duration.between(startTime, Instant.now()).toSeconds();
 
         sb.append("# Server\r\n");
@@ -223,11 +300,55 @@ public final class CommandHandler {
                 .append("\r\n");
         }
 
+        sb.append("# Raft\r\n");
+        if (distributedStore != null) {
+            RaftNode rn = distributedStore.getRaftNode();
+            sb.append("raft_enabled:true\r\n");
+            sb.append("node_id:")
+                .append(distributedStore.getNodeId().id())
+                .append("\r\n");
+            sb.append("role:").append(rn.getRole().name()).append("\r\n");
+            sb.append("current_term:")
+                .append(rn.getCurrentTerm())
+                .append("\r\n");
+            NodeId leader = distributedStore.getLeaderId();
+            sb.append("leader_id:")
+                .append(leader != null ? leader.id() : "none")
+                .append("\r\n");
+            sb.append("commit_index:")
+                .append(rn.getCommitIndex())
+                .append("\r\n");
+            sb.append("last_applied:")
+                .append(rn.getLastApplied())
+                .append("\r\n");
+        } else {
+            sb.append("raft_enabled:false\r\n");
+        }
+
         return CommandResult.reply(RespValue.bulkString(sb.toString()));
     }
 
+    private CommandResult handleRaftStatus() {
+        if (distributedStore == null) {
+            return CommandResult.reply(
+                RespValue.bulkString("raft_enabled:false\r\n")
+            );
+        }
+        RaftNode rn = distributedStore.getRaftNode();
+        NodeId leader = distributedStore.getLeaderId();
+        String summary = String.format(
+            "node_id:%s,role:%s,term:%d,leader:%s,commit_index:%d,last_applied:%d",
+            distributedStore.getNodeId().id(),
+            rn.getRole().name(),
+            rn.getCurrentTerm(),
+            leader != null ? leader.id() : "none",
+            rn.getCommitIndex(),
+            rn.getLastApplied()
+        );
+        return CommandResult.reply(RespValue.bulkString(summary));
+    }
+
     private CommandResult handleConfig(List<RespValue> args) {
-        // args may be [CONFIG, GET, save] or [GET, save]
         int offset =
             args.size() > 0 && "CONFIG".equalsIgnoreCase(args.get(0).asString())
                 ? 1
@@ -286,7 +407,6 @@ public final class CommandHandler {
     }
 
     private CommandResult handleCommandDocs() {
-        // Return empty array for client handshake negotiation
         return CommandResult.reply(RespValue.EMPTY_ARRAY);
     }
 }

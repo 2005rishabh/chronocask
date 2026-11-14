@@ -1,6 +1,7 @@
 package io.chronocask.server;
 
 import io.chronocask.api.ChronoCask;
+import io.chronocask.raft.DistributedChronoCask;
 import io.chronocask.server.command.CommandHandler;
 import io.chronocask.server.command.CommandResult;
 import io.chronocask.server.resp.RespReader;
@@ -21,7 +22,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * High-performance standalone TCP server for ChronoCask supporting the
+ * High-performance standalone or distributed TCP server for ChronoCask supporting the
  * Redis Serialization Protocol (RESP2) using Java 25 Virtual Threads.
  */
 public final class ChronoCaskServer implements Closeable {
@@ -48,6 +49,21 @@ public final class ChronoCaskServer implements Closeable {
         this.commandHandler = new CommandHandler(store);
     }
 
+    private ChronoCaskServer(
+        DistributedChronoCask distributedStore,
+        String host,
+        int port
+    ) {
+        Objects.requireNonNull(
+            distributedStore,
+            "distributedStore cannot be null"
+        );
+        this.store = distributedStore.getStore();
+        this.host = Objects.requireNonNull(host, "host cannot be null");
+        this.requestedPort = port;
+        this.commandHandler = new CommandHandler(distributedStore);
+    }
+
     public static ChronoCaskServer create(ChronoCask store) {
         return create(store, DEFAULT_HOST, DEFAULT_PORT);
     }
@@ -62,6 +78,27 @@ public final class ChronoCaskServer implements Closeable {
         int port
     ) {
         return new ChronoCaskServer(store, host, port);
+    }
+
+    public static ChronoCaskServer create(
+        DistributedChronoCask distributedStore
+    ) {
+        return create(distributedStore, DEFAULT_HOST, DEFAULT_PORT);
+    }
+
+    public static ChronoCaskServer create(
+        DistributedChronoCask distributedStore,
+        int port
+    ) {
+        return create(distributedStore, DEFAULT_HOST, port);
+    }
+
+    public static ChronoCaskServer create(
+        DistributedChronoCask distributedStore,
+        String host,
+        int port
+    ) {
+        return new ChronoCaskServer(distributedStore, host, port);
     }
 
     /**
