@@ -1,28 +1,77 @@
 # ChronoCask
 
-> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, Safe Segment Compaction, JMH Benchmarking, and Standalone Redis/RESP TCP Server.
+> **ChronoCask**: A High-Performance Persistent Key-Value Storage Engine in Java with Append-Only Log Segments, Off-Heap Indexing, Crash Recovery, Safe Segment Compaction, JMH Benchmarking, Standalone Redis/RESP TCP Server, and Raft Distributed Consensus.
 
 ---
 
 ## 1. Overview
 
-ChronoCask is an embedded and standalone persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, deterministic crash recovery, crash-safe segment compaction, and high-concurrency client-server networking with **Java 25 Virtual Threads**.
+ChronoCask is a persistent key-value storage engine inspired by the Bitcask model. It is designed to explore systems-level data storage, low Java heap allocation via the **Foreign Function & Memory (FFM) API**, sequential log-structured disk I/O, deterministic crash recovery, crash-safe segment compaction, high-concurrency client-server networking with **Java 25 Virtual Threads**, and multi-node fault-tolerant replication via **Raft Distributed Consensus (Phase 3)**.
 
-### Key Architectural Highlights
+### Architectural Phases & Milestones
 
-- **Append-Only Disk Storage**: Eliminates random disk writes during mutations by writing sequential records to append-only log segments.
-- **In-Memory KeyDir Index**: Maps keys to exact segment and byte offsets for $O(1)$ read lookups without scanning disk logs.
-- **Native Memory Management**: Implements an off-heap hash-table index using Java's FFM API (`MemorySegment`, `Arena`) to eliminate Java GC overhead for large key spaces.
-- **Authoritative Storage Manifest**: Persistently describes the authoritative generation of active and immutable segments (`MANIFEST`), ensuring deterministic crash consistency without directory file heuristics.
-- **Fast Startup via Hint Files**: Generates durable `.hint` files for sealed segments, enabling sub-millisecond recovery by reading index metadata without loading full payload values.
-- **Safe Prefix Compaction**: Enforces a strict contiguous-prefix boundary rule starting from the oldest segment to eliminate superseded records and tombstones without risking deleted key resurrection.
-- **Standalone Redis-Compatible Server**: Speaks the standard Redis Serialization Protocol (RESP2), allowing any Redis client (`redis-cli`, Python, Jedis, Go, Node.js) to interact directly with ChronoCask.
-- **Virtual Thread Concurrency**: Powered by Java 25 virtual threads (`Thread.ofVirtual()`), handling thousands of concurrent client connections with near-zero memory footprint and zero thread-pool exhaustion.
-- **Rigorous JMH Performance Benchmarking**: Built-in microbenchmark harness evaluating Heap vs. Off-Heap index performance, record framing throughput, and end-to-end storage engine I/O.
+- **Phase 1: Embedded Storage Engine (Milestones 1–6)**
+  - Append-only disk segments (`FileChannel`, big-endian binary framing, CRC32C).
+  - High-performance in-memory KeyDir index (JVM Heap & Native Off-Heap FFM `MemorySegment`).
+  - Crash recovery manager with bit-rot detection, tail corruption truncation, and hint files.
+  - Safe contiguous-prefix log compaction with atomic storage manifest commit.
+- **Phase 2: Standalone Network Server & Benchmarks (Milestones 7–8)**
+  - Rigorous JMH microbenchmarking suite evaluating off-heap FFM vs. JVM heap performance.
+  - Standalone high-concurrency TCP server speaking Redis Serialization Protocol (RESP2).
+  - Java 25 virtual thread concurrency model handling thousands of simultaneous client sessions.
+  - Smart batch coalescing for pipelined requests exceeding 150k+ req/sec.
+- **Phase 3: Distributed Key-Value Database (Milestone 9)**
+  - Replicated state machine backed by ChronoCask storage engines.
+  - Raft consensus engine (Ongaro & Ousterhout): leader election, randomized timeouts, heartbeat broadcasts.
+  - Monotonic 1-based log indexing with suffix conflict truncation and reconciliation.
+  - Majority quorum commit coordination, network partition tolerance, and automatic healing.
 
 ---
 
-## 2. Standalone Redis/RESP Server (Milestone 8)
+## 2. Distributed Raft Cluster (Milestone 9)
+
+ChronoCask can be deployed as a multi-node replicated cluster providing linearizable writes and fault tolerance:
+
+```java
+import io.chronocask.raft.DistributedChronoCask;
+import io.chronocask.raft.model.NodeId;
+import io.chronocask.raft.rpc.RaftTransport;
+
+import java.nio.file.Path;
+import java.util.Set;
+
+// Configure cluster node IDs
+NodeId n1 = NodeId.of("node-1");
+NodeId n2 = NodeId.of("node-2");
+NodeId n3 = NodeId.of("node-3");
+
+// Open distributed ChronoCask node connected to cluster peers
+try (DistributedChronoCask clusterNode = DistributedChronoCask.open(
+        Path.of("./data/node-1"),
+        n1,
+        Set.of(n2, n3),
+        transport
+)) {
+    // Write mutation proposed to leader, replicated across cluster, and committed on quorum
+    if (clusterNode.isLeader()) {
+        clusterNode.put("cluster:config:replication_factor", "3");
+    }
+
+    // Local state-machine read
+    String val = clusterNode.get("cluster:config:replication_factor");
+    System.out.println("Replicated value: " + val);
+}
+```
+
+### Cluster Fault Tolerance & Partition Healing
+
+- **Majority Quorum**: In a 3-node cluster, 2 nodes constitute a quorum. If the leader is isolated or crashes, the surviving 2 nodes detect election timeout and elect a new leader.
+- **Split-Brain Protection**: An isolated node in a minority partition cannot commit new writes.
+- **Log Healing & Reconciliation**: When an isolated node rejoins, it receives `AppendEntries` with a higher term, steps down to follower, truncates any uncommitted conflicting suffix entries, and applies the authoritative leader log.
+
+---
+
+## 3. Standalone Redis/RESP Server (Milestone 8)
 
 ChronoCask includes a standalone high-concurrency TCP server speaking the standard Redis protocol:
 
@@ -72,7 +121,7 @@ OK
 
 ---
 
-## 3. Embedded Java Client API
+## 4. Embedded Java Client API
 
 ChronoCask can also be used directly as an embedded database library:
 
@@ -113,7 +162,7 @@ try (ChronoCask store = ChronoCask.open(Path.of("./data"))) {
 
 ---
 
-## 4. Directory Layout & Persistence Model
+## 5. Directory Layout & Persistence Model
 
 ```text
 chronocask-data/
@@ -131,7 +180,7 @@ chronocask-data/
 
 ---
 
-## 5. Performance Benchmarks (Milestone 7)
+## 6. Performance Benchmarks (Milestone 7)
 
 Microbenchmarks run on **OpenJDK 25 (Ubuntu x86_64)** via the OpenJDK JMH harness:
 
@@ -157,13 +206,13 @@ Microbenchmarks run on **OpenJDK 25 (Ubuntu x86_64)** via the OpenJDK JMH harnes
 
 ---
 
-## 6. Requirements & Build Verification
+## 7. Requirements & Build Verification
 
 - **Java Development Kit (JDK)**: Java 25
 - **Build Tool**: Apache Maven 3.8+
 
 ```bash
-# Clean and run full unit/integration test suite (75 tests)
+# Clean and run full unit/integration test suite (94 tests)
 mvn clean test
 
 # Run the JMH benchmark suite
